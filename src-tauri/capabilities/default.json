@@ -1,0 +1,21 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for AriaNg App",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-spawn",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "aria2c",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    },
+    "dialog:default",
+    "process:default"
+  ]
+}

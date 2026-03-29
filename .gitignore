@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Rust build artifacts
+src-tauri/target/
+
+# Tauri generated files
+src-tauri/gen/
+
+# aria2 sidecar binaries (downloaded per-platform, not committed)
+src-tauri/binaries/aria2c-*
+
+# AriaNg frontend files (downloaded at build time)
+frontend/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.*

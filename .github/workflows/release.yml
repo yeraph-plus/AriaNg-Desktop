@@ -1,0 +1,237 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  ARIA2_VERSION: "1.37.0"
+  ARIANG_VERSION: "1.3.8"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows-x64
+            bundles: nsis
+          - os: macos-13
+            target: x86_64-apple-darwin
+            label: macOS-x64
+            bundles: dmg
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macOS-ARM64
+            bundles: dmg
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: Linux-x64
+            bundles: deb,appimage
+
+    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.label }})
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      # ── System dependencies ──
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # ── aria2c binary ──
+
+      # Windows: download pre-built static binary from official releases
+      - name: Download aria2 binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/aria2/aria2/releases/download/release-${{ env.ARIA2_VERSION }}/aria2-${{ env.ARIA2_VERSION }}-win-64bit-build1.zip"
+          $zipFile = "$env:TEMP\aria2.zip"
+          $extractDir = "$env:TEMP\aria2-extract"
+
+          Write-Host "Downloading aria2 from: $url"
+          Invoke-WebRequest -Uri $url -OutFile $zipFile -UseBasicParsing
+          Expand-Archive -Path $zipFile -DestinationPath $extractDir -Force
+
+          $aria2Exe = Get-ChildItem -Path $extractDir -Recurse -Filter "aria2c.exe" | Select-Object -First 1
+          $targetPath = "src-tauri\binaries\aria2c-${{ matrix.target }}.exe"
+
+          New-Item -ItemType Directory -Force -Path "src-tauri\binaries" | Out-Null
+          Copy-Item -Path $aria2Exe.FullName -Destination $targetPath -Force
+          Write-Host "aria2c placed at: $targetPath"
+
+      # macOS: build from source with static linking to avoid Homebrew dylib dependencies
+      - name: Build aria2 from source (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -e
+
+          # Install build dependencies
+          brew install pkg-config openssl@3 c-ares libssh2 sqlite
+
+          # Download aria2 source
+          curl -fSL "https://github.com/aria2/aria2/releases/download/release-${{ env.ARIA2_VERSION }}/aria2-${{ env.ARIA2_VERSION }}.tar.xz" -o /tmp/aria2.tar.xz
+          tar xf /tmp/aria2.tar.xz -C /tmp
+          cd /tmp/aria2-${{ env.ARIA2_VERSION }}
+
+          # Configure with static linking (prefer .a over .dylib via pkg-config --static)
+          export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix c-ares)/lib/pkgconfig:$(brew --prefix libssh2)/lib/pkgconfig:$(brew --prefix sqlite)/lib/pkgconfig"
+
+          ./configure \
+            --without-gnutls \
+            --with-openssl \
+            --with-libcares \
+            --with-libssh2 \
+            --with-sqlite3 \
+            --without-libxml2 \
+            --without-libexpat \
+            ARIA2_STATIC=yes
+
+          make -j$(sysctl -n hw.logicalcpu)
+
+          # Verify: should only depend on /usr/lib/ system libraries
+          echo "=== aria2c dependencies ==="
+          otool -L src/aria2c
+          echo "=== architecture ==="
+          file src/aria2c
+
+          # Place binary
+          mkdir -p "$GITHUB_WORKSPACE/src-tauri/binaries"
+          cp src/aria2c "$GITHUB_WORKSPACE/src-tauri/binaries/aria2c-${{ matrix.target }}"
+          chmod +x "$GITHUB_WORKSPACE/src-tauri/binaries/aria2c-${{ matrix.target }}"
+
+      # Linux: build from source with full static linking
+      - name: Build aria2 from source (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+
+          # Install build dependencies (dev packages include static .a libraries)
+          sudo apt-get install -y \
+            autoconf automake libtool pkg-config \
+            libssl-dev libc-ares-dev libssh2-1-dev \
+            libsqlite3-dev zlib1g-dev
+
+          # Download aria2 source
+          curl -fSL "https://github.com/aria2/aria2/releases/download/release-${{ env.ARIA2_VERSION }}/aria2-${{ env.ARIA2_VERSION }}.tar.xz" -o /tmp/aria2.tar.xz
+          tar xf /tmp/aria2.tar.xz -C /tmp
+          cd /tmp/aria2-${{ env.ARIA2_VERSION }}
+
+          ./configure \
+            --without-gnutls \
+            --with-openssl \
+            --with-libcares \
+            --with-libssh2 \
+            --with-sqlite3 \
+            ARIA2_STATIC=yes
+
+          make -j$(nproc)
+
+          # Verify linkage
+          echo "=== aria2c dependencies ==="
+          ldd src/aria2c 2>&1 || echo "(statically linked)"
+          echo "=== architecture ==="
+          file src/aria2c
+
+          # Place binary
+          mkdir -p "$GITHUB_WORKSPACE/src-tauri/binaries"
+          cp src/aria2c "$GITHUB_WORKSPACE/src-tauri/binaries/aria2c-${{ matrix.target }}"
+          chmod +x "$GITHUB_WORKSPACE/src-tauri/binaries/aria2c-${{ matrix.target }}"
+
+      # ── Download AriaNg ──
+
+      - name: Download AriaNg
+        shell: bash
+        run: |
+          ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${{ env.ARIANG_VERSION }}/AriaNg-${{ env.ARIANG_VERSION }}.zip"
+          echo "Downloading AriaNg from: $ARIANG_URL"
+
+          curl -fSL -o /tmp/ariang.zip "$ARIANG_URL"
+          rm -rf frontend
+          mkdir -p frontend
+          unzip -q -o /tmp/ariang.zip -d frontend
+
+          if [ ! -f "frontend/index.html" ]; then
+            echo "Error: frontend/index.html not found!"
+            exit 1
+          fi
+          echo "AriaNg extracted successfully"
+
+      # ── Build ──
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "AriaNg App ${{ github.ref_name }}"
+          releaseBody: "Download the installer for your platform below."
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      # ── Windows: portable zip ──
+
+      - name: Create portable zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $releaseDir = "src-tauri\target\x86_64-pc-windows-msvc\release"
+          $portableDir = "$env:TEMP\AriaNg-portable"
+          $zipName = "AriaNg_${{ github.ref_name }}_windows-x64-portable.zip"
+
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item "$releaseDir\AriaNg App.exe" "$portableDir\" -Force
+          Copy-Item "$releaseDir\aria2c.exe" "$portableDir\" -Force
+
+          Compress-Archive -Path "$portableDir\*" -DestinationPath $zipName -Force
+          Write-Host "Portable zip created: $zipName"
+          Get-ChildItem $portableDir
+
+      - name: Upload portable zip to release (Windows)
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ZIP_NAME="AriaNg_${{ github.ref_name }}_windows-x64-portable.zip"
+          gh release upload "${{ github.ref_name }}" "$ZIP_NAME" --clobber

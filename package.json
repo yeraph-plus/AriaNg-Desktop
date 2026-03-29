@@ -1,0 +1,15 @@
+{
+  "name": "ariang-app",
+  "version": "0.0.1",
+  "description": "A modern desktop download manager powered by Tauri, aria2, and AriaNg",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "png-to-ico": "^3.0.1",
+    "sharp": "^0.34.5"
+  }
+}
