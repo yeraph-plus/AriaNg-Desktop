@@ -1,7 +1,7 @@
 {
   "productName": "AriaNg App",
   "version": "0.0.1",
-  "identifier": "com.ariang.app",
+  "identifier": "com.ariang.desktop",
   "build": {
     "frontendDist": "../frontend",
     "beforeBuildCommand": "",
