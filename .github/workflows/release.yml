@@ -134,43 +134,16 @@ jobs:
           cp src/aria2c "$GITHUB_WORKSPACE/src-tauri/binaries/aria2c-${{ matrix.target }}"
           chmod +x "$GITHUB_WORKSPACE/src-tauri/binaries/aria2c-${{ matrix.target }}"
 
-      # Linux: build from source with full static linking
-      - name: Build aria2 from source (Linux)
+      # Linux: install from apt (dynamically linked, deps are standard system libraries)
+      - name: Install aria2 (Linux)
         if: runner.os == 'Linux'
         run: |
-          set -e
-
-          # Install build dependencies (dev packages include static .a libraries)
-          sudo apt-get install -y \
-            autoconf automake libtool pkg-config \
-            libssl-dev libc-ares-dev libssh2-1-dev \
-            libsqlite3-dev zlib1g-dev
-
-          # Download aria2 source
-          curl -fSL "https://github.com/aria2/aria2/releases/download/release-${{ env.ARIA2_VERSION }}/aria2-${{ env.ARIA2_VERSION }}.tar.xz" -o /tmp/aria2.tar.xz
-          tar xf /tmp/aria2.tar.xz -C /tmp
-          cd /tmp/aria2-${{ env.ARIA2_VERSION }}
-
-          ./configure \
-            --without-gnutls \
-            --with-openssl \
-            --with-libcares \
-            --with-libssh2 \
-            --with-sqlite3 \
-            ARIA2_STATIC=yes
-
-          make -j$(nproc)
-
-          # Verify linkage
-          echo "=== aria2c dependencies ==="
-          ldd src/aria2c 2>&1 || echo "(statically linked)"
-          echo "=== architecture ==="
-          file src/aria2c
-
-          # Place binary
-          mkdir -p "$GITHUB_WORKSPACE/src-tauri/binaries"
-          cp src/aria2c "$GITHUB_WORKSPACE/src-tauri/binaries/aria2c-${{ matrix.target }}"
-          chmod +x "$GITHUB_WORKSPACE/src-tauri/binaries/aria2c-${{ matrix.target }}"
+          sudo apt-get install -y aria2
+          mkdir -p src-tauri/binaries
+          cp "$(which aria2c)" "src-tauri/binaries/aria2c-${{ matrix.target }}"
+          chmod +x "src-tauri/binaries/aria2c-${{ matrix.target }}"
+          echo "aria2c version: $(aria2c --version | head -1)"
+          echo "aria2c placed at: src-tauri/binaries/aria2c-${{ matrix.target }}"
 
       # ── Download AriaNg ──
 
@@ -219,7 +192,7 @@ jobs:
           $zipName = "AriaNg_${{ github.ref_name }}_windows-x64-portable.zip"
 
           New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
-          Copy-Item "$releaseDir\AriaNg App.exe" "$portableDir\" -Force
+          Copy-Item "$releaseDir\ariang-app.exe" "$portableDir\AriaNg Desktop.exe" -Force
           Copy-Item "$releaseDir\aria2c.exe" "$portableDir\" -Force
 
           Compress-Archive -Path "$portableDir\*" -DestinationPath $zipName -Force
