@@ -21,5 +21,8 @@ pub const SIDECAR_NAME: &str = "aria2c";
 /// Config file name
 pub const CONFIG_FILE_NAME: &str = "config.json";
 
+/// AriaNg options persistence file name
+pub const ARIANG_OPTIONS_FILE_NAME: &str = "ariang_options.json";
+
 /// aria2 session file name
 pub const SESSION_FILE_NAME: &str = "aria2.session";

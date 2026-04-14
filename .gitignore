@@ -8,7 +8,7 @@ src-tauri/target/
 src-tauri/gen/
 
 # aria2 sidecar binaries (downloaded per-platform, not committed)
-src-tauri/binaries/aria2c-*
+src-tauri/binaries/
 
 # AriaNg frontend files (downloaded at build time)
 frontend/

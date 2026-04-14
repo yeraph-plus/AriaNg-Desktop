@@ -3,6 +3,7 @@ use tauri::{App, Manager};
 
 use crate::aria2::config::Aria2Config;
 use crate::aria2::manager::Aria2Manager;
+use crate::constants::ARIANG_OPTIONS_FILE_NAME;
 
 /// Initialize the application on startup.
 /// - Load or create aria2 config
@@ -51,9 +52,10 @@ pub fn initialize(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Inject JavaScript into the webview to configure AriaNg's localStorage
-/// with the correct RPC host and port. The RPC secret is intentionally
-/// left for the user to configure through AriaNg's settings UI.
+/// Inject JavaScript into the webview to:
+/// 1. Restore persisted AriaNg.Options from disk into localStorage (if available)
+/// 2. Configure the correct RPC host/port/protocol
+/// 3. Periodically persist AriaNg.Options changes back to disk via Tauri command
 fn setup_ariang_config_injection(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     let window = app
         .get_webview_window("main")
@@ -62,24 +64,54 @@ fn setup_ariang_config_injection(app: &App) -> Result<(), Box<dyn std::error::Er
     let manager = app.state::<Aria2Manager>();
     let port = manager.get_port();
 
+    // Load previously persisted AriaNg options from disk
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let options_path = app_data_dir.join(ARIANG_OPTIONS_FILE_NAME);
+    let saved_options = std::fs::read_to_string(&options_path).ok();
+
+    // Escape the JSON string for embedding in JS (handle quotes, backslashes, newlines)
+    let saved_options_js = match &saved_options {
+        Some(json) => {
+            let escaped = json
+                .replace('\\', "\\\\")
+                .replace('\'', "\\'")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r");
+            format!("'{}'", escaped)
+        }
+        None => "null".to_string(),
+    };
+
     let js = format!(
         r#"
         (function() {{
+            var savedOptions = {saved_options_js};
+
             function configureAriaNg() {{
                 try {{
                     var optionsJson = localStorage.getItem('AriaNg.Options');
 
-                    if (!optionsJson) {{
+                    if (!optionsJson && !savedOptions) {{
                         // First run - AriaNg hasn't initialized yet, wait
                         setTimeout(configureAriaNg, 500);
                         return;
+                    }}
+
+                    // Restore persisted options if localStorage is empty but disk has saved data
+                    if (!optionsJson && savedOptions) {{
+                        localStorage.setItem('AriaNg.Options', savedOptions);
+                        optionsJson = savedOptions;
+                        console.log('[AriaNg App] Restored options from disk');
                     }}
 
                     var options = JSON.parse(optionsJson);
                     var rpcPort = '{port}';
                     var needsReload = false;
 
-                    // Only update host/port/protocol, leave secret for user
+                    // Only update host/port/protocol, leave secret and other settings for user
                     if (options.rpcHost !== '127.0.0.1' || options.rpcPort !== rpcPort || options.protocol !== 'ws') {{
                         options.rpcHost = '127.0.0.1';
                         options.rpcPort = rpcPort;
@@ -89,12 +121,33 @@ fn setup_ariang_config_injection(app: &App) -> Result<(), Box<dyn std::error::Er
                         needsReload = true;
                     }}
 
+                    // Start periodic persistence of AriaNg.Options to disk
+                    setupOptionsPersistence();
+
                     if (needsReload) {{
                         setTimeout(function() {{ location.reload(); }}, 200);
                     }}
                 }} catch (e) {{
                     console.error('[AriaNg App] Failed to configure AriaNg:', e);
                 }}
+            }}
+
+            // Periodically check for AriaNg.Options changes and persist to disk
+            function setupOptionsPersistence() {{
+                var lastSaved = localStorage.getItem('AriaNg.Options') || '';
+
+                setInterval(function() {{
+                    try {{
+                        var current = localStorage.getItem('AriaNg.Options');
+                        if (current && current !== lastSaved) {{
+                            lastSaved = current;
+                            window.__TAURI_INTERNALS__.invoke('save_ariang_options', {{ json: current }});
+                            console.log('[AriaNg App] Options persisted to disk');
+                        }}
+                    }} catch (e) {{
+                        console.error('[AriaNg App] Failed to persist options:', e);
+                    }}
+                }}, 5000);
             }}
 
             if (document.readyState === 'complete') {{
@@ -106,6 +159,7 @@ fn setup_ariang_config_injection(app: &App) -> Result<(), Box<dyn std::error::Er
             }}
         }})();
         "#,
+        saved_options_js = saved_options_js,
         port = port,
     );
 
@@ -113,7 +167,11 @@ fn setup_ariang_config_injection(app: &App) -> Result<(), Box<dyn std::error::Er
         .eval(&js)
         .map_err(|e| format!("Failed to inject AriaNg config: {}", e))?;
 
-    info!("AriaNg RPC host/port injection scheduled");
+    if saved_options.is_some() {
+        info!("AriaNg config injection scheduled (with persisted options restored)");
+    } else {
+        info!("AriaNg config injection scheduled (no persisted options found)");
+    }
     Ok(())
 }
 

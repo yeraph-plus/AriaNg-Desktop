@@ -46,6 +46,7 @@ pub fn run() {
             commands::get_aria2_status,
             commands::restart_aria2,
             commands::sync_window_title,
+            commands::save_ariang_options,
         ])
         // Handle window close - minimize to tray instead of exiting
         .on_window_event(|window, event| {
