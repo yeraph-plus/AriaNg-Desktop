@@ -1,6 +1,6 @@
 [package]
 name = "ariang-app"
-version = "0.0.1"
+version = "1.0.0"
 edition = "2021"
 description = "A modern desktop download manager powered by Tauri, aria2, and AriaNg"
 
@@ -22,3 +22,4 @@ serde_json = "1"
 log = "0.4"
 env_logger = "0.11"
 tokio = { version = "1", features = ["time", "sync"] }
+tauri-plugin-notification = "2"

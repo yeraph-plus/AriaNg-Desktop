@@ -12,6 +12,7 @@ pub fn run() {
     env_logger::init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         // Single instance plugin - must be registered first
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // When a second instance is launched, focus the existing window
@@ -46,7 +47,6 @@ pub fn run() {
             commands::get_aria2_status,
             commands::restart_aria2,
             commands::sync_window_title,
-            commands::save_ariang_options,
         ])
         // Handle window close - minimize to tray instead of exiting
         .on_window_event(|window, event| {

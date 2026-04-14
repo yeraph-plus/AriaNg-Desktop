@@ -1,7 +1,9 @@
 {
   "identifier": "default",
   "description": "Default capabilities for AriaNg App",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "shell:allow-spawn",
@@ -16,6 +18,7 @@
       ]
     },
     "dialog:default",
-    "process:default"
+    "process:default",
+    "notification:default"
   ]
 }

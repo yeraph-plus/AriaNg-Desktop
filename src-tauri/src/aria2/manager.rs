@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -7,18 +8,20 @@ use tauri::AppHandle;
 use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_shell::ShellExt;
 
-use crate::aria2::config::Aria2Config;
+use crate::aria2::config;
 use crate::aria2::port::find_available_port;
 use crate::constants::{
-    ARIA2_SHUTDOWN_TIMEOUT_SECS, CRASH_WINDOW_SECS, MAX_CRASH_RETRIES, SIDECAR_NAME,
+    ARIA2_SHUTDOWN_TIMEOUT_SECS, CRASH_WINDOW_SECS, DEFAULT_RPC_PORT, MAX_CRASH_RETRIES,
+    SIDECAR_NAME,
 };
 
 pub struct Aria2Manager {
     app_handle: AppHandle,
-    config: Arc<Mutex<Aria2Config>>,
+    conf_path: PathBuf,
+    rpc_secret: String,
     child_handle: Arc<Mutex<Option<CommandChild>>>,
     shutdown_flag: Arc<AtomicBool>,
-    app_data_dir: std::path::PathBuf,
+    app_data_dir: PathBuf,
     /// Tracks the actual RPC port in use (may differ from config if port was busy)
     actual_port: Arc<Mutex<u16>>,
     /// Tracks the aria2c process PID for fallback kill
@@ -28,19 +31,36 @@ pub struct Aria2Manager {
 impl Aria2Manager {
     pub fn new(
         app_handle: AppHandle,
-        config: Aria2Config,
-        app_data_dir: std::path::PathBuf,
+        conf_path: PathBuf,
+        rpc_secret: String,
+        preferred_port: u16,
+        app_data_dir: PathBuf,
     ) -> Self {
-        let port = config.rpc_port;
         Self {
             app_handle,
-            config: Arc::new(Mutex::new(config)),
+            conf_path,
+            rpc_secret,
             child_handle: Arc::new(Mutex::new(None)),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             app_data_dir,
-            actual_port: Arc::new(Mutex::new(port)),
+            actual_port: Arc::new(Mutex::new(preferred_port)),
             process_pid: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Build aria2c startup arguments: --conf-path plus optional port override.
+    fn build_args(conf_path: &Path, preferred_port: u16, actual_port: u16) -> Vec<String> {
+        let mut args = vec![format!(
+            "--conf-path={}",
+            conf_path.to_string_lossy().replace('\\', "/")
+        )];
+
+        // CLI args override conf file values, so only add port if it differs
+        if actual_port != preferred_port {
+            args.push(format!("--rpc-listen-port={}", actual_port));
+        }
+
+        args
     }
 
     /// Start the aria2c sidecar process.
@@ -49,14 +69,14 @@ impl Aria2Manager {
             return Ok(());
         }
 
-        let config = self.config.lock().map_err(|e| e.to_string())?.clone();
+        let preferred_port = config::get_preferred_port(&self.conf_path);
 
         // Find available port
-        let port = find_available_port(config.rpc_port)?;
-        if port != config.rpc_port {
+        let port = find_available_port(preferred_port)?;
+        if port != preferred_port {
             info!(
                 "Port {} is busy, using port {} instead",
-                config.rpc_port, port
+                preferred_port, port
             );
         }
 
@@ -65,18 +85,11 @@ impl Aria2Manager {
             *actual = port;
         }
 
-        // Update config with actual port
-        if let Ok(mut cfg) = self.config.lock() {
-            cfg.rpc_port = port;
-        }
-
         // Ensure session file exists
-        let session_path = Aria2Config::ensure_session_file(&self.app_data_dir)?;
+        config::ensure_session_file(&self.app_data_dir)?;
 
-        // Build args with actual port
-        let mut args_config = config.clone();
-        args_config.rpc_port = port;
-        let args = args_config.to_aria2_args(&session_path);
+        // Build args: --conf-path + optional port override
+        let args = Self::build_args(&self.conf_path, preferred_port, port);
 
         info!("Starting aria2c on port {} with sidecar", port);
 
@@ -107,7 +120,7 @@ impl Aria2Manager {
         // Spawn monitor task
         let shutdown_flag = self.shutdown_flag.clone();
         let child_handle = self.child_handle.clone();
-        let config_clone = self.config.clone();
+        let conf_path = self.conf_path.clone();
         let app_handle = self.app_handle.clone();
         let app_data_dir = self.app_data_dir.clone();
         let actual_port = self.actual_port.clone();
@@ -173,12 +186,8 @@ impl Aria2Manager {
                         }
 
                         // Restart aria2c
-                        let config = match config_clone.lock() {
-                            Ok(c) => c.clone(),
-                            Err(_) => break,
-                        };
-
-                        let port = match find_available_port(config.rpc_port) {
+                        let preferred = config::get_preferred_port(&conf_path);
+                        let port = match find_available_port(preferred) {
                             Ok(p) => p,
                             Err(e) => {
                                 error!("Failed to find available port for restart: {}", e);
@@ -190,18 +199,12 @@ impl Aria2Manager {
                             *actual = port;
                         }
 
-                        let session_path =
-                            match Aria2Config::ensure_session_file(&app_data_dir) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    error!("Failed to ensure session file: {}", e);
-                                    break;
-                                }
-                            };
+                        if let Err(e) = config::ensure_session_file(&app_data_dir) {
+                            error!("Failed to ensure session file: {}", e);
+                            break;
+                        }
 
-                        let mut restart_config = config.clone();
-                        restart_config.rpc_port = port;
-                        let args = restart_config.to_aria2_args(&session_path);
+                        let args = Aria2Manager::build_args(&conf_path, preferred, port);
 
                         let shell = app_handle.shell();
                         match shell.sidecar(SIDECAR_NAME) {
@@ -215,10 +218,7 @@ impl Aria2Manager {
                                     if let Ok(mut handle) = child_handle.lock() {
                                         *handle = Some(new_child);
                                     }
-                                    info!(
-                                        "aria2c restarted on port {}, pid={}",
-                                        port, new_pid
-                                    );
+                                    info!("aria2c restarted on port {}, pid={}", port, new_pid);
                                     drop(new_rx);
                                 }
                                 Err(e) => {
@@ -251,6 +251,9 @@ impl Aria2Manager {
             return Ok(());
         }
 
+        // Persist runtime options to aria2.conf before killing the process
+        self.persist_runtime_options();
+
         self.kill_aria2_process();
         Ok(())
     }
@@ -277,15 +280,10 @@ impl Aria2Manager {
             .lock()
             .map(|p| *p)
             .unwrap_or(DEFAULT_RPC_PORT);
-        let secret = self
-            .config
-            .lock()
-            .map(|c| c.rpc_secret.clone())
-            .unwrap_or_default();
 
         // Try graceful shutdown via JSON-RPC
         info!("Sending aria2.shutdown RPC call to port {}", port);
-        match send_shutdown_rpc(port, &secret) {
+        match send_shutdown_rpc(port, &self.rpc_secret) {
             Ok(_) => info!("aria2 shutdown RPC sent successfully"),
             Err(e) => warn!("Failed to send aria2 shutdown RPC: {}", e),
         }
@@ -340,10 +338,7 @@ impl Aria2Manager {
 
     /// Get the RPC secret.
     pub fn get_secret(&self) -> String {
-        self.config
-            .lock()
-            .map(|c| c.rpc_secret.clone())
-            .unwrap_or_default()
+        self.rpc_secret.clone()
     }
 
     /// Check if aria2c is currently running.
@@ -353,10 +348,26 @@ impl Aria2Manager {
             .map(|h| h.is_some())
             .unwrap_or(false)
     }
-}
 
-/// Default RPC port constant (used when lock fails)
-const DEFAULT_RPC_PORT: u16 = 6800;
+    /// Fetch current aria2 global options via RPC and persist changes to aria2.conf.
+    fn persist_runtime_options(&self) {
+        let port = self.get_port();
+
+        match fetch_global_options(port, &self.rpc_secret) {
+            Ok(options) => match config::sync_conf_with_runtime(&self.conf_path, &options) {
+                Ok(updated) => {
+                    if updated {
+                        info!("aria2.conf updated with runtime option changes");
+                    } else {
+                        info!("aria2.conf is already up-to-date, no changes needed");
+                    }
+                }
+                Err(e) => warn!("Failed to sync aria2.conf: {}", e),
+            },
+            Err(e) => warn!("Failed to fetch aria2 global options: {}", e),
+        }
+    }
+}
 
 /// Force kill a process by PID using OS-level commands.
 fn force_kill_by_pid(pid: u32) {
@@ -424,7 +435,9 @@ fn send_shutdown_rpc(port: u16, secret: &str) -> Result<(), String> {
 
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = TcpStream::connect_timeout(
-        &addr.parse().map_err(|e| format!("Invalid address: {}", e))?,
+        &addr
+            .parse()
+            .map_err(|e| format!("Invalid address: {}", e))?,
         Duration::from_secs(2),
     )
     .map_err(|e| format!("Failed to connect to aria2 RPC: {}", e))?;
@@ -446,4 +459,94 @@ fn send_shutdown_rpc(port: u16, secret: &str) -> Result<(), String> {
 
     info!("aria2 shutdown RPC response: {}", response);
     Ok(())
+}
+
+/// Send an aria2.getGlobalOption JSON-RPC call and return the result as key-value pairs.
+fn fetch_global_options(
+    port: u16,
+    secret: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":"getGlobalOption","method":"aria2.getGlobalOption","params":["token:{}"]}}"#,
+        secret
+    );
+
+    let request = format!(
+        "POST /jsonrpc HTTP/1.1\r\n\
+         Host: 127.0.0.1:{}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        port,
+        body.len(),
+        body
+    );
+
+    let addr = format!("127.0.0.1:{}", port);
+    let mut stream = TcpStream::connect_timeout(
+        &addr
+            .parse()
+            .map_err(|e| format!("Invalid address: {}", e))?,
+        Duration::from_secs(2),
+    )
+    .map_err(|e| format!("Failed to connect to aria2 RPC: {}", e))?;
+
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| format!("Failed to set write timeout: {}", e))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| format!("Failed to set read timeout: {}", e))?;
+
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("Failed to send getGlobalOption request: {}", e))?;
+
+    // Shutdown write half to signal end of request
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("Failed to read getGlobalOption response: {}", e))?;
+
+    // Extract JSON body from HTTP response (skip headers)
+    let json_body = response
+        .find("\r\n\r\n")
+        .or_else(|| response.find("\n\n"))
+        .map(|pos| &response[pos..])
+        .unwrap_or(&response)
+        .trim();
+
+    // Parse the JSON-RPC response to extract the "result" object
+    let parsed: serde_json::Value = serde_json::from_str(json_body).map_err(|e| {
+        format!(
+            "Failed to parse getGlobalOption JSON: {} (body: {})",
+            e, json_body
+        )
+    })?;
+
+    let result = parsed
+        .get("result")
+        .ok_or("getGlobalOption response missing 'result' field")?;
+
+    let result_obj = result
+        .as_object()
+        .ok_or("getGlobalOption 'result' is not an object")?;
+
+    let mut options = HashMap::new();
+    for (key, value) in result_obj {
+        if let Some(v) = value.as_str() {
+            options.insert(key.clone(), v.to_string());
+        }
+    }
+
+    info!("Fetched {} global options from aria2", options.len());
+    Ok(options)
 }
